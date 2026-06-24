@@ -22,7 +22,6 @@ export function useRealtimeVoice({ businessId, onTranscriptUpdate, onStateChange
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -227,6 +226,7 @@ export function useRealtimeVoice({ businessId, onTranscriptUpdate, onStateChange
       updateState("error");
       disconnect();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [businessId, updateState, addTranscriptEntry]);
 
   const disconnect = useCallback(async () => {
