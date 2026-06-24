@@ -11,7 +11,7 @@
     "clear": "rm -rf node_modules package-lock.json .next"
   },
   "dependencies": {
-    "@google/genai": "^0.1.2",
+    "@google/genai": "latest",
     "@hookform/resolvers": "^3.10.0",
     "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.108.2",
