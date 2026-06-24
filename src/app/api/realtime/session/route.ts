@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { buildSystemPrompt } from "@/ai/tools";
+import { buildSystemPrompt, geminiToolDeclarations } from "@/ai/tools";
 
+// Returns the Gemini session config (system prompt + tools + API key)
+// The client uses this to establish a WebSocket connection to Gemini Live API
 export async function POST(req: NextRequest) {
   try {
     const { businessId } = await req.json();
@@ -9,18 +11,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "businessId is required" }, { status: 400 });
     }
 
-    const instructions = await buildSystemPrompt(businessId);
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: "GEMINI_API_KEY not configured" }, { status: 500 });
+    }
 
-    // For Gemini Live API, we don't need to create an ephemeral session token on the server
-    // (though for strict production security, an intermediate proxy is recommended).
-    // For this boilerplate, we return the system instructions to the client, 
-    // which will initialize the @google/genai SDK directly.
-    return NextResponse.json({ 
-      instructions,
-      model: "gemini-2.0-flash-exp",
+    // Build the dynamic system prompt from business data
+    const systemPrompt = await buildSystemPrompt(businessId);
+
+    // Return config for the client to connect
+    return NextResponse.json({
+      apiKey,
+      model: "gemini-2.0-flash-live-001",
+      systemPrompt,
+      tools: [{ functionDeclarations: geminiToolDeclarations }],
     });
   } catch (error) {
     console.error("Session creation error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json({ error: "Failed to create session" }, { status: 500 });
   }
 }

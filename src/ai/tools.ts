@@ -1,15 +1,23 @@
-import { Type, FunctionDeclaration } from "@google/genai";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+import { DEFAULT_SOMALI_SYSTEM_PROMPT } from "@/constants";
+import type { Tables } from "@/types/database";
+
+// ─── Row Type Aliases ────────────────────────────────────────
+type ServiceRow = Tables<"services">;
+type FAQRow = Tables<"faqs">;
+type BusinessRow = Tables<"businesses">;
+type AppointmentRow = Tables<"appointments">;
 
 // ─── Tool Definitions for Gemini Live API ────────────────────
 
-export const voiceTools: FunctionDeclaration[] = [
+export const geminiToolDeclarations = [
   {
     name: "lookup_services",
     description: "Look up the list of services this business offers, including prices and durations. Call this when a customer asks about available services, pricing, or what the business does.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
       },
       required: ["business_id"],
     },
@@ -18,21 +26,21 @@ export const voiceTools: FunctionDeclaration[] = [
     name: "lookup_faqs",
     description: "Search frequently asked questions for this business. Call this when a customer asks a general question about the business, policies, or procedures.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
-        query: { type: Type.STRING, description: "The customer's question" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
+        query: { type: "STRING" as const, description: "The customer's question" },
       },
-      required: ["business_id", "query"],
+      required: ["business_id"],
     },
   },
   {
     name: "get_business_info",
     description: "Get business details like name, address, phone, email, and description. Call this when a customer asks for contact info, location, or general business details.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
       },
       required: ["business_id"],
     },
@@ -41,9 +49,9 @@ export const voiceTools: FunctionDeclaration[] = [
     name: "get_business_hours",
     description: "Get business operating hours. Call this when a customer asks about opening/closing times or whether the business is open.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
       },
       required: ["business_id"],
     },
@@ -52,10 +60,10 @@ export const voiceTools: FunctionDeclaration[] = [
     name: "check_availability",
     description: "Check available appointment time slots for a specific date. Call this when a customer wants to book an appointment and needs to know available times.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
-        date: { type: Type.STRING, description: "The date to check in YYYY-MM-DD format" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
+        date: { type: "STRING" as const, description: "The date to check in YYYY-MM-DD format" },
       },
       required: ["business_id", "date"],
     },
@@ -64,15 +72,15 @@ export const voiceTools: FunctionDeclaration[] = [
     name: "book_appointment",
     description: "Book an appointment for a customer. Call this when the customer confirms they want to book at a specific date and time. You must have their name and the date/time before calling this.",
     parameters: {
-      type: Type.OBJECT,
+      type: "OBJECT" as const,
       properties: {
-        business_id: { type: Type.STRING, description: "The business ID" },
-        customer_name: { type: Type.STRING, description: "Customer's full name" },
-        customer_phone: { type: Type.STRING, description: "Customer's phone number (optional)" },
-        date: { type: Type.STRING, description: "Appointment date in YYYY-MM-DD format" },
-        time_slot: { type: Type.STRING, description: "Appointment time like '10:00 AM'" },
-        service_id: { type: Type.STRING, description: "The service ID if specified (optional)" },
-        notes: { type: Type.STRING, description: "Any additional notes" },
+        business_id: { type: "STRING" as const, description: "The business ID" },
+        customer_name: { type: "STRING" as const, description: "Customer's full name" },
+        customer_phone: { type: "STRING" as const, description: "Customer's phone number (optional)" },
+        date: { type: "STRING" as const, description: "Appointment date in YYYY-MM-DD format" },
+        time_slot: { type: "STRING" as const, description: "Appointment time like '10:00 AM'" },
+        service_id: { type: "STRING" as const, description: "The service ID if specified (optional)" },
+        notes: { type: "STRING" as const, description: "Any additional notes" },
       },
       required: ["business_id", "customer_name", "date", "time_slot"],
     },
@@ -80,14 +88,6 @@ export const voiceTools: FunctionDeclaration[] = [
 ];
 
 // ─── Tool Execution ──────────────────────────────────────────
-import { supabaseAdmin } from "@/lib/supabase/admin";
-import { DEFAULT_SOMALI_SYSTEM_PROMPT } from "@/constants";
-import type { Tables } from "@/types/database";
-
-type ServiceRow = Tables<"services">;
-type FAQRow = Tables<"faqs">;
-type BusinessRow = Tables<"businesses">;
-type AppointmentRow = Tables<"appointments">;
 
 export async function executeTool(
   toolName: string,

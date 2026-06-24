@@ -1,18 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { executeTool } from "@/ai/tools";
 
+// Executes a tool function call from Gemini and returns the result
+// Called by the client when Gemini sends a functionCall message
 export async function POST(req: NextRequest) {
   try {
-    const { toolName, args } = await req.json();
+    const { functionCall } = await req.json();
 
-    if (!toolName || !args) {
-      return NextResponse.json({ error: "toolName and args are required" }, { status: 400 });
+    if (!functionCall?.name || !functionCall?.args) {
+      return NextResponse.json({ error: "Invalid function call" }, { status: 400 });
     }
 
-    const result = await executeTool(toolName, args);
-    return NextResponse.json({ result });
+    const result = await executeTool(functionCall.name, functionCall.args);
+
+    return NextResponse.json({
+      functionResponse: {
+        name: functionCall.name,
+        response: JSON.parse(result),
+      },
+    });
   } catch (error) {
     console.error("Tool execution error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json({ error: "Tool execution failed" }, { status: 500 });
   }
 }

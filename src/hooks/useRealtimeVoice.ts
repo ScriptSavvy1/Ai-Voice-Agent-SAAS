@@ -1,297 +1,354 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import { GoogleGenAI, Modality } from "@google/genai";
-import { voiceTools } from "@/ai/tools";
-import type { TranscriptEntry } from "@/types/database";
-import type { VoiceSessionState } from "@/types";
+import { useVoiceStore } from "@/store/voice";
 
-interface UseRealtimeVoiceOptions {
-  businessId: string;
-  onTranscriptUpdate?: (transcript: TranscriptEntry[]) => void;
-  onStateChange?: (state: VoiceSessionState) => void;
+// ─── PCM Audio Helpers ───────────────────────────────────────
+
+function float32ToPcm16(float32: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buffer;
 }
 
-export function useRealtimeVoice({ businessId, onTranscriptUpdate, onStateChange }: UseRealtimeVoiceOptions) {
-  const [state, setState] = useState<VoiceSessionState>("idle");
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [duration, setDuration] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+function pcm16ToFloat32(pcm16: ArrayBuffer): Float32Array {
+  const view = new DataView(pcm16);
+  const float32 = new Float32Array(view.byteLength / 2);
+  for (let i = 0; i < float32.length; i++) {
+    float32[i] = view.getInt16(i * 2, true) / 0x8000;
+  }
+  return float32;
+}
 
-  // Gemini Live API refs
-  const sessionRef = useRef<any>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+// ─── Downsample from browser's native rate to 16kHz ──────────
+
+function downsample(buffer: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate) return buffer;
+  const ratio = fromRate / toRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const idx = Math.round(i * ratio);
+    result[i] = buffer[Math.min(idx, buffer.length - 1)];
+  }
+  return result;
+}
+
+// ─── Main Hook ───────────────────────────────────────────────
+
+export function useRealtimeVoice() {
+  const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "error">("idle");
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const playbackQueueRef = useRef<Float32Array[]>([]);
+  const isPlayingRef = useRef(false);
+  const businessIdRef = useRef<string>("");
 
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const startTimeRef = useRef<number>(0);
+  const {
+    setIsConnected,
+    setIsListening,
+    setIsSpeaking,
+    addTranscriptEntry,
+  } = useVoiceStore();
 
-  const updateState = useCallback((newState: VoiceSessionState) => {
-    setState(newState);
-    onStateChange?.(newState);
-  }, [onStateChange]);
+  // ─── Audio Playback ──────────────────────────────────────
 
-  const addTranscriptEntry = useCallback((entry: TranscriptEntry) => {
-    setTranscript((prev) => {
-      const updated = [...prev, entry];
-      onTranscriptUpdate?.(updated);
-      return updated;
-    });
-  }, [onTranscriptUpdate]);
+  const playNextChunk = useCallback(() => {
+    if (!audioCtxRef.current || playbackQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      setIsSpeaking(false);
+      return;
+    }
 
-  const connect = useCallback(async () => {
+    isPlayingRef.current = true;
+    setIsSpeaking(true);
+
+    const chunk = playbackQueueRef.current.shift()!;
+    const buffer = audioCtxRef.current.createBuffer(1, chunk.length, 24000);
+    buffer.getChannelData(0).set(chunk);
+
+    const source = audioCtxRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioCtxRef.current.destination);
+    source.onended = () => playNextChunk();
+    source.start();
+  }, [setIsSpeaking]);
+
+  const enqueueAudio = useCallback((pcmBase64: string) => {
+    const pcmBuffer = base64ToArrayBuffer(pcmBase64);
+    const float32 = pcm16ToFloat32(pcmBuffer);
+    playbackQueueRef.current.push(float32);
+
+    if (!isPlayingRef.current) {
+      playNextChunk();
+    }
+  }, [playNextChunk]);
+
+  // ─── Connect ─────────────────────────────────────────────
+
+  const connect = useCallback(async (businessId: string) => {
+    if (wsRef.current) return;
+    businessIdRef.current = businessId;
+    setStatus("connecting");
+
     try {
-      updateState("connecting");
-      setError(null);
-      setTranscript([]);
-      startTimeRef.current = Date.now();
-
-      // 1. Get system instructions from our API
-      const sessionRes = await fetch("/api/realtime/session", {
+      // 1. Get session config from our API
+      const res = await fetch("/api/realtime/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ businessId }),
       });
 
-      if (!sessionRes.ok) {
-        throw new Error("Failed to get session config");
-      }
+      if (!res.ok) throw new Error("Failed to get session config");
+      const config = await res.json();
 
-      const { instructions, model } = await sessionRes.json();
+      // 2. Open WebSocket to Gemini Live API
+      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${config.apiKey}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-      // Ensure API key is available (in a real app, use a proxy endpoint for better security)
-      // Next.js requires NEXT_PUBLIC_ for client-side access, but we'll use the server
-      // to proxy requests if needed. For this demo, we assume the key is accessible or proxied.
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-         throw new Error("GEMINI_API_KEY is missing. Please add it to .env.local and prefix with NEXT_PUBLIC_ for client side access during testing.");
-      }
-
-      // 2. Initialize Gemini SDK
-      const ai = new GoogleGenAI({ apiKey });
-
-      // 3. Setup Audio Capture (16kHz PCM)
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-        channelCount: 1,
-        sampleRate: 16000,
-      } });
-      streamRef.current = stream;
-
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      audioContextRef.current = audioCtx;
-
-      // We need an AudioWorklet to capture raw PCM
-      // For simplicity in this demo, we'll assume a basic worklet or script processor
-      // (ScriptProcessorNode is deprecated but easier to inline without external files)
-      const source = audioCtx.createMediaStreamSource(stream);
-      sourceNodeRef.current = source;
-      
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      source.connect(processor);
-      processor.connect(audioCtx.destination);
-
-      // 4. Connect to Gemini Live API
-      const session = await ai.live.connect({
-        model: model,
-        config: {
-           systemInstruction: { parts: [{ text: instructions }] },
-           tools: [{ functionDeclarations: voiceTools }],
-           responseModalities: [Modality.AUDIO],
-           speechConfig: {
-              voiceConfig: {
-                 prebuiltVoiceConfig: {
-                    voiceName: "Aoede", // Options: Aoede, Charon, Fenrir, Kore, Puck
-                 }
-              }
-           }
-        },
-      });
-
-      sessionRef.current = session;
-      updateState("connected");
-
-      // 5. Handle Audio Input (Mic to Gemini)
-      processor.onaudioprocess = (e) => {
-         if (state !== "speaking" && sessionRef.current) {
-             const inputData = e.inputBuffer.getChannelData(0);
-             // Convert Float32 to Int16 PCM
-             const pcmData = new Int16Array(inputData.length);
-             for (let i = 0; i < inputData.length; i++) {
-                 pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-             }
-             
-             // Send audio chunk
-             sessionRef.current.send({
-                 realtimeInput: {
-                     mediaChunks: [{
-                         mimeType: "audio/pcm;rate=16000",
-                         data: Buffer.from(pcmData.buffer).toString('base64')
-                     }]
-                 }
-             });
-         }
+      ws.onopen = () => {
+        // Send setup message
+        const setupMsg = {
+          setup: {
+            model: `models/${config.model}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: "Aoede",
+                  },
+                },
+              },
+            },
+            systemInstruction: {
+              parts: [{ text: config.systemPrompt }],
+            },
+            tools: config.tools,
+          },
+        };
+        ws.send(JSON.stringify(setupMsg));
       };
 
-      // 6. Handle Gemini Events
-      // The GenAI SDK uses async iteration for messages
-      (async () => {
-         try {
-             for await (const message of session) {
-                 if (message.serverContent?.modelTurn?.parts) {
-                     for (const part of message.serverContent.modelTurn.parts) {
-                         // Handle Audio Output
-                         if (part.inlineData && part.inlineData.mimeType.startsWith("audio/pcm")) {
-                             updateState("speaking");
-                             
-                             // Decode Base64 PCM to AudioBuffer and play
-                             const binaryStr = atob(part.inlineData.data);
-                             const bytes = new Uint8Array(binaryStr.length);
-                             for (let i = 0; i < binaryStr.length; i++) {
-                                 bytes[i] = binaryStr.charCodeAt(i);
-                             }
-                             const int16Array = new Int16Array(bytes.buffer);
-                             const float32Array = new Float32Array(int16Array.length);
-                             for (let i = 0; i < int16Array.length; i++) {
-                                 float32Array[i] = int16Array[i] / 0x7FFF;
-                             }
-                             
-                             const outBuffer = audioCtx.createBuffer(1, float32Array.length, 24000); // Gemini out is 24kHz
-                             outBuffer.copyToChannel(float32Array, 0);
-                             
-                             const sourceNode = audioCtx.createBufferSource();
-                             sourceNode.buffer = outBuffer;
-                             sourceNode.connect(audioCtx.destination);
-                             sourceNode.start();
-                             
-                             sourceNode.onended = () => {
-                                 updateState("connected");
-                             };
-                         }
-                         
-                         // Handle Text Transcript
-                         if (part.text) {
-                             addTranscriptEntry({
-                                 role: "assistant",
-                                 content: part.text,
-                                 timestamp: new Date().toISOString()
-                             });
-                         }
-                         
-                         // Handle Function Calls
-                         if (part.functionCall) {
-                             const { name, args } = part.functionCall;
-                             
-                             // Execute tool on server
-                             const toolRes = await fetch("/api/realtime/tools", {
-                               method: "POST",
-                               headers: { "Content-Type": "application/json" },
-                               body: JSON.stringify({
-                                 toolName: name,
-                                 args: args,
-                               }),
-                             });
+      ws.onmessage = async (event) => {
+        let msg: any;
+        
+        if (event.data instanceof Blob) {
+          const text = await event.data.text();
+          msg = JSON.parse(text);
+        } else {
+          msg = JSON.parse(event.data);
+        }
 
-                             const { result } = await toolRes.json();
+        // Setup complete
+        if (msg.setupComplete) {
+          setStatus("connected");
+          setIsConnected(true);
+          setIsListening(true);
+          startMicrophone();
+          addTranscriptEntry("assistant", "Asalaamu calaykum! Sideen kuu caawin karaa?");
+          return;
+        }
 
-                             // Send tool result back
-                             sessionRef.current.send({
-                                 toolResponse: {
-                                     functionResponses: [{
-                                         id: part.functionCall.id,
-                                         name: name,
-                                         response: { result }
-                                     }]
-                                 }
-                             });
-                         }
-                     }
-                 }
-             }
-         } catch (e) {
-             console.error("Gemini Session Error:", e);
-             setError("Lost connection to AI");
-             disconnect();
-         }
-      })();
+        // Server content (audio or text)
+        const serverContent = msg.serverContent;
+        if (serverContent) {
+          if (serverContent.modelTurn?.parts) {
+            for (const part of serverContent.modelTurn.parts) {
+              if (part.inlineData?.data) {
+                // Audio response
+                enqueueAudio(part.inlineData.data);
+              }
+              if (part.text) {
+                // Text transcript from model
+                addTranscriptEntry("assistant", part.text);
+              }
+            }
+          }
 
-      // Duration timer
-      timerRef.current = setInterval(() => {
-        setDuration(Math.floor((Date.now() - startTimeRef.current) / 1000));
-      }, 1000);
+          // Turn complete
+          if (serverContent.turnComplete) {
+            setIsSpeaking(false);
+            setIsListening(true);
+          }
+          return;
+        }
+
+        // Tool call from Gemini
+        const toolCall = msg.toolCall;
+        if (toolCall?.functionCalls) {
+          for (const fc of toolCall.functionCalls) {
+            // Execute tool on our server
+            const toolRes = await fetch("/api/realtime/tools", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ functionCall: { name: fc.name, args: fc.args } }),
+            });
+
+            const toolResult = await toolRes.json();
+
+            // Send function response back to Gemini
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                toolResponse: {
+                  functionResponses: [{
+                    id: fc.id,
+                    name: fc.name,
+                    response: toolResult.functionResponse?.response || { error: "Tool failed" },
+                  }],
+                },
+              }));
+            }
+          }
+          return;
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        setStatus("error");
+        cleanup();
+      };
+
+      ws.onclose = () => {
+        setStatus("idle");
+        cleanup();
+      };
 
     } catch (err) {
       console.error("Connection error:", err);
-      setError(err instanceof Error ? err.message : "Connection failed");
-      updateState("error");
-      disconnect();
+      setStatus("error");
+      cleanup();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId, updateState, addTranscriptEntry]);
+  }, [setIsConnected, setIsListening, setIsSpeaking, addTranscriptEntry, enqueueAudio]);
+
+  // ─── Microphone Capture ──────────────────────────────────
+
+  const startMicrophone = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+      streamRef.current = stream;
+
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      audioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      // Use ScriptProcessorNode for broad browser compatibility
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const downsampled = downsample(inputData, audioCtx.sampleRate, 16000);
+        const pcm = float32ToPcm16(downsampled);
+        const base64 = arrayBufferToBase64(pcm);
+
+        // Send audio chunk to Gemini
+        wsRef.current.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: "audio/pcm;rate=16000",
+              data: base64,
+            }],
+          },
+        }));
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+    } catch (err) {
+      console.error("Microphone error:", err);
+      setStatus("error");
+    }
+  }, []);
+
+  // ─── Cleanup ─────────────────────────────────────────────
+
+  const cleanup = useCallback(() => {
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    audioCtxRef.current?.close();
+    wsRef.current?.close();
+
+    processorRef.current = null;
+    sourceRef.current = null;
+    streamRef.current = null;
+    audioCtxRef.current = null;
+    wsRef.current = null;
+    playbackQueueRef.current = [];
+    isPlayingRef.current = false;
+
+    setIsConnected(false);
+    setIsListening(false);
+    setIsSpeaking(false);
+  }, [setIsConnected, setIsListening, setIsSpeaking]);
+
+  // ─── Disconnect ──────────────────────────────────────────
 
   const disconnect = useCallback(async () => {
-    // Stop timer
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-
-    // Close Gemini session
-    if (sessionRef.current) {
-      // The SDK session object might not have an explicit close, we just stop sending
-      sessionRef.current = null;
-    }
-
-    // Close Audio Context
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-
-    // Stop mic
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-
-    const finalDuration = startTimeRef.current
-      ? Math.floor((Date.now() - startTimeRef.current) / 1000)
-      : 0;
-
-    // Save conversation
-    if (transcript.length > 0) {
+    // Save conversation before disconnecting
+    const transcript = useVoiceStore.getState().transcript;
+    if (transcript.length > 0 && businessIdRef.current) {
       try {
         await fetch("/api/conversations", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            business_id: businessId,
+            business_id: businessIdRef.current,
             transcript,
-            duration_seconds: finalDuration,
+            summary: `Voice call — ${transcript.length} messages`,
+            duration_seconds: 0,
             language: "so",
-            appointment_booked: transcript.some((t) =>
-              t.content.toLowerCase().includes("booked") ||
-              t.content.toLowerCase().includes("appointment") ||
-              t.content.includes("balan")
-            ),
           }),
         });
-      } catch (err) {
-        console.error("Failed to save conversation:", err);
+      } catch (e) {
+        console.error("Failed to save conversation:", e);
       }
     }
 
-    updateState("idle");
-    setDuration(0);
-  }, [businessId, transcript, updateState]);
+    cleanup();
+    setStatus("idle");
+    useVoiceStore.getState().clearTranscript();
+  }, [cleanup]);
 
-  return {
-    state,
-    transcript,
-    duration,
-    error,
-    connect,
-    disconnect,
-    isConnected: state !== "idle" && state !== "error",
-  };
+  return { status, connect, disconnect };
 }
